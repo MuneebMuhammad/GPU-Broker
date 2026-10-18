@@ -35,9 +35,33 @@ ESTIMATOR_DEFAULTS: Final = {
     "epochs": 1,
 }
 
+INFERENCE_DEFAULTS: Final = {
+    "concurrent_sequences": 1,
+    "precision": "BF16",
+    "kv_cache_precision": "BF16",
+}
+
+# Inference weights and KV cache are accounted for separately. These values
+# are independent of full-fine-tuning bytes/parameter and optimizer states.
+INFERENCE_WEIGHT_BYTES: Final = {
+    "pure_fp32": 4, "bf16": 2, "fp16": 2,
+    "fp8": 1, "int8": 1, "int4": 0.5,
+}
+INFERENCE_PRECISION_ALIASES: Final = {
+    "purefp32": "pure_fp32", "fp32": "pure_fp32", "float32": "pure_fp32",
+    "bf16": "bf16", "bfloat16": "bf16", "purebf16": "bf16", "bf16mixed": "bf16",
+    "fp16": "fp16", "float16": "fp16", "purefp16": "fp16", "fp16mixed": "fp16",
+    "fp8": "fp8", "float8": "fp8", "fp8mixed": "fp8",
+    "int8": "int8", "int4": "int4",
+}
+# INFERENCE_KV_BYTES: Final = {"bf16": 2, "fp8": 1}
+# INFERENCE_KV_ALIASES: Final = {
+#     "bf16": "bf16", "bfloat16": "bf16", "fp8": "fp8", "float8": "fp8",
+# }
+
 # These names do not uniquely identify a public pretrained checkpoint.
 # Supply explicit architecture inputs, or add a verified profile below.
-# UNRESOLVED_MODEL_NAMES: Final = ("LabLM", "HelpDeskLM", "MiniServe")
+UNRESOLVED_MODEL_NAMES: Final = ("LabLM", "HelpDeskLM", "MiniServe")
 
 
 def _profile(

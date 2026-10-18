@@ -1,7 +1,7 @@
-"""Deterministic, approximate dense-transformer estimator for a semester project.
+"""Deterministic dense-transformer training and inference resource estimates.
 
 Python 3.10+, standard library only. No network access, model download, or training.
-All GB values are decimal (1 GB = 10**9 bytes). Checkpointing is always enabled.
+All GB values are decimal (1 GB = 10**9 bytes). Training assumes checkpointing.
 Run this file to see an example using explicitly illustrative hourly prices.
 """
 
@@ -14,6 +14,8 @@ import re
 from typing import Mapping
 
 from consts import ESTIMATOR_DEFAULTS, get_model_defaults, normalize_model_name
+from consts import (
+    INFERENCE_DEFAULTS, INFERENCE_WEIGHT_BYTES, INFERENCE_PRECISION_ALIASES)
 
 
 # Aggregate effective throughput for the WHOLE instance, already including MFU.
@@ -329,10 +331,200 @@ def estimate_training(
     }
 
 
+def estimate_inference(
+    model_name: str,
+    parameter_count: str | int | float | None = None,
+    sequence_length: int | None = None,
+    precision: str | None = None,
+    number_of_layers: int | None = None,
+    hidden_size: int | None = None,
+    concurrent_sequences: int | None = None,
+    *,
+    kv_cache_precision: str | None = None,
+    shard_model_states: bool = True,
+    extra_memory_gb_per_gpu: float = 0.0,
+) -> dict:
+    """Estimate inference memory and select the first feasible GPU configuration.
+
+    Known L and h: M_bytes = 1.2*N*b_w + B*S*2*L*h*b_kv.
+    Missing either: M_bytes = 1.2*N*b_w + B*S*0.14*N**(2/3)*(b_kv/2).
+    The fallback is exactly the supplied 0.14 formula for the default BF16 KV
+    cache. FP8 KV storage halves that BF16 fallback coefficient.
+
+    N, L, h, and sequence_length are filled from consts.py when omitted/None.
+    Explicit inputs always win. Unknown models need N and sequence_length;
+    if L or h is unavailable, use the fallback without inventing architecture.
+    B defaults to 1; weight precision and KV precision independently default
+    to BF16. Weight formats: PureFP32, BF16, FP16, FP8, INT8, INT4.
+
+    S is the SAME sequence_length argument/default as in estimate_training.
+    For inference it budgets the total prompt-plus-generated context per
+    concurrent sequence. An omitted S uses the checkpoint's full context limit.
+
+    For shard_model_states=True, total model memory AND KV cache are evenly
+    sharded across all GPUs on each candidate. B applies to that sharded group.
+    This is an ideal model/tensor-parallel assumption, not data parallelism.
+    False keeps the entire model and B sequences' KV cache on EACH GPU; B is
+    then per replica. Neither mode assumes CPU offloading or additional nodes.
+
+    The supplied formula uses full hidden size, without a GQA reduction, even
+    when the registry knows the number of KV heads. No checkpointing/optimizer
+    state is included. 20% weight overhead is part of the requested formula;
+    90% usable VRAM and optional extra_memory_gb_per_gpu are also retained.
+
+    FP8 weights or FP8 KV require native FP8 support in the supplied GPU table.
+    INT8/INT4 are storage estimates and assume suitable serving kernels.
+    This estimates memory feasibility only, not latency, throughput, deployment,
+    serving-runtime compatibility, or endpoint pricing.
+    """
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name must be a nonempty string.")
+    if normalize_model_name(model_name) in {"", "null", "none"}:
+        raise ValueError("model_name cannot be blank, null, or None.")
+
+    profile = get_model_defaults(model_name)
+    defaulted_fields = []
+    input_sources = {}
+    resolved = {
+        "parameter_count": parameter_count,
+        "sequence_length": sequence_length,
+        "number_of_layers": number_of_layers,
+        "hidden_size": hidden_size,
+    }
+    for field, value in resolved.items():
+        if value is None and profile is not None:
+            resolved[field] = profile[field]
+            defaulted_fields.append(field)
+            input_sources[field] = "model_defaults"
+        else:
+            input_sources[field] = "explicit" if value is not None else "unavailable"
+    missing = [field for field in ("parameter_count", "sequence_length") if resolved[field] is None]
+    if missing:
+        raise ValueError(f"No registered defaults for {model_name!r}. Provide " + ", ".join(missing) + ".")
+
+    workflow = {"concurrent_sequences": concurrent_sequences,
+                "precision": precision, "kv_cache_precision": kv_cache_precision}
+    for field, value in workflow.items():
+        if value is None:
+            workflow[field] = INFERENCE_DEFAULTS[field]
+            defaulted_fields.append(field)
+            input_sources[field] = "inference_defaults"
+        else:
+            input_sources[field] = "explicit"
+
+    n = parse_parameter_count(resolved["parameter_count"])
+    s = _positive(resolved["sequence_length"], "sequence_length", integer=True)
+    b = _positive(workflow["concurrent_sequences"], "concurrent_sequences", integer=True)
+    layers = None if resolved["number_of_layers"] is None else _positive(resolved["number_of_layers"], "number_of_layers", integer=True)
+    h = None if resolved["hidden_size"] is None else _positive(resolved["hidden_size"], "hidden_size", integer=True)
+    mode = INFERENCE_PRECISION_ALIASES.get(_key(workflow["precision"]))
+    if mode is None:
+        raise ValueError("Inference precision must be PureFP32, BF16, FP16, FP8, INT8, or INT4.")
+    kv_mode = INFERENCE_PRECISION_ALIASES.get(_key(workflow["kv_cache_precision"]))
+    if kv_mode is None:
+        raise ValueError("kv_cache_precision must be PureFP32, BF16, FP16, FP8, INT8, or INT4.")
+    if not isinstance(shard_model_states, bool):
+        raise ValueError("shard_model_states must be True or False.")
+    try:
+        extra = float(extra_memory_gb_per_gpu)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError("extra_memory_gb_per_gpu must be finite and nonnegative.") from exc
+    if isinstance(extra_memory_gb_per_gpu, bool) or not math.isfinite(extra) or extra < 0:
+        raise ValueError("extra_memory_gb_per_gpu must be finite and nonnegative.")
+
+    b_w = INFERENCE_WEIGHT_BYTES[mode]
+    b_kv = INFERENCE_WEIGHT_BYTES[kv_mode]
+    raw_weights_gb = n * b_w / 1e9
+    model_memory_gb = 1.2 * n * b_w / 1e9
+    if layers is not None and h is not None:
+        kv_bytes_per_token = 2 * layers * h * b_kv
+        kv_formula = "2*L*h*b_kv"
+    else:
+        kv_bytes_per_token = 0.14 * n ** (2 / 3) * (b_kv / 2)
+        kv_formula = "0.14*N**(2/3)*(b_kv/2)"
+    kv_memory_gb = b * s * kv_bytes_per_token / 1e9
+    memory_gb = model_memory_gb + kv_memory_gb
+    warnings = ["KV cache uses the full-hidden-size formula requested, without a grouped-query attention reduction."]
+    if profile is not None and profile["note"]:
+        warnings.append(profile["note"])
+    if input_sources["sequence_length"] == "model_defaults":
+        warnings.append("Sequence length defaulted to the checkpoint context limit; pass your serving context length if shorter.")
+    if profile is not None and s > profile["max_position_embeddings"]:
+        warnings.append("Explicit sequence_length exceeds the registered checkpoint context limit; context extension is not configured.")
+    if layers is None or h is None:
+        warnings.append("Layers or hidden size unavailable; using the parameter-count KV cache heuristic.")
+
+    candidates = []
+    for name, gpu, gpus, vram, _bf16_tf, _fp32_tf, fp8_tf in GPU_CATALOG:
+        shards = gpus if shard_model_states else 1
+        model_per_gpu = model_memory_gb / shards
+        kv_per_gpu = kv_memory_gb / shards
+        required_gb = model_per_gpu + kv_per_gpu + extra
+        usable_gb = 0.9 * vram
+        supported = not ((mode == "fp8" or kv_mode == "fp8") and fp8_tf is None)
+        fits = required_gb <= usable_gb
+        reasons = []
+        if not supported:
+            reasons.append("Requested FP8 weights or KV cache require native FP8 support in the supplied GPU table.")
+        if not fits:
+            reasons.append(f"Needs {required_gb:.3f} GB/GPU; only {usable_gb:.3f} GB/GPU usable.")
+        candidates.append({
+            "instance": name, "gpu": gpu, "gpu_count": gpus, "shards": shards,
+            "usable_memory_gb_per_gpu": usable_gb,
+            "usable_memory_gb_total": usable_gb * gpus,
+            "model_memory_gb_per_gpu": model_per_gpu,
+            "kv_cache_memory_gb_per_gpu": kv_per_gpu,
+            "extra_memory_gb_per_gpu": extra,
+            "required_memory_gb_per_gpu": required_gb,
+            "required_memory_gb_total": required_gb * gpus,
+            "precision_supported": supported, "fits_memory": fits,
+            "feasible": supported and fits, "rejection_reasons": reasons,
+        })
+    best = next((row for row in candidates if row["feasible"]), None)
+    return {
+        "model_name": model_name,
+        "resolved_model_name": None if profile is None else profile["model_name"],
+        "checkpoint_id": None if profile is None else profile["checkpoint_id"],
+        "parameter_count": n, "sequence_length": s, "concurrent_sequences": b,
+        "number_of_layers_used": layers, "hidden_size_used": h,
+        "precision": mode, "bytes_per_weight": b_w,
+        "kv_cache_precision": kv_mode, "bytes_per_kv_element": b_kv,
+        "raw_weight_memory_gb": raw_weights_gb,
+        "model_memory_gb_including_overhead": model_memory_gb,
+        "kv_cache_bytes_per_token": kv_bytes_per_token,
+        "kv_cache_memory_gb": kv_memory_gb,
+        "estimated_memory_gb": memory_gb,
+        "memory_formula": "1.2*N*b_w + B*S*kv_cache_bytes_per_token",
+        "kv_cache_formula": kv_formula,
+        "shard_model_states": shard_model_states,
+        "memory_distribution": "even model-and-KV sharding" if shard_model_states else "replicated model and B-sequence KV cache on each GPU",
+        "defaulted_fields": defaulted_fields, "input_sources": input_sources,
+        "model_default_sources": [] if profile is None else list(profile["sources"]),
+        # "candidates": candidates, "recommended": best,
+        "status": "estimated_configuration_found" if best else "no_feasible_configuration",
+        "selection_rule": "First memory-feasible, precision-supported configuration in catalog order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge, ml.p4d.24xlarge, ml.p5.48xlarge.",
+        "assumptions": [
+            "Multi-GPU sharding, if enabled, is idealized and requires a compatible inference runtime.",
+        ],
+        "warnings": warnings,
+    }
+
+
 if __name__ == "__main__":
-    result = estimate_training(
-        model_name="Llama 3.1 8B", dataset_size_gb=0.4,
-        sequence_length=4096, batch_size=2, training_method="LoRA",
-        # Parameter count, layers, and hidden size come from consts.py.
+    # result = estimate_training(
+    #     model_name="Llama 3.1 8B", dataset_size_gb=0.4,
+    #     sequence_length=4096, batch_size=2, training_method="LoRA",
+    #     # Parameter count, layers, and hidden size come from consts.py.
+    # )
+    # print(json.dumps(result, indent=2, allow_nan=False))
+
+    result = estimate_inference(
+    model_name="Llama 3.1 8B",
+    sequence_length=4096,
+    precision="BF16",
+    concurrent_sequences=1,     # Default: 1
+    kv_cache_precision="BF16",  # Default: BF16
     )
-    print(json.dumps(result, indent=2, allow_nan=False))
+
+    print(result["estimated_memory_gb"])
+    print(result["recommended"])
