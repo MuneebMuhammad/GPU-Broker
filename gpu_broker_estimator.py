@@ -13,6 +13,8 @@ import math
 import re
 from typing import Mapping
 
+from consts import ESTIMATOR_DEFAULTS, get_model_defaults, normalize_model_name
+
 
 # Aggregate effective throughput for the WHOLE instance, already including MFU.
 # Order: BF16/FP16 Tensor Core, pure FP32 (no TF32), FP8 Tensor Core.
@@ -87,15 +89,15 @@ def parse_parameter_count(value: str | int | float) -> int:
 
 def estimate_training(
     model_name: str,
-    parameter_count: str | int | float,
-    dataset_size_gb: float,
-    sequence_length: int,
-    batch_size: int,
-    training_method: str,
-    precision: str = "BF16",
+    parameter_count: str | int | float | None = None,
+    dataset_size_gb: float | None = None,
+    sequence_length: int | None = None,
+    batch_size: int | None = None,
+    training_method: str | None = None,
+    precision: str | None = None,
     number_of_layers: int | None = None,
     hidden_size: int | None = None,
-    epochs: int = 1,
+    epochs: int | None = None,
     *,
     lora_rank: int = 16,
     bytes_per_token: float = 4.0,
@@ -105,6 +107,18 @@ def estimate_training(
     qlora_time_multiplier: float = 1.3,
 ) -> dict:
     """Estimate all five configurations and choose the first feasible one.
+
+    Missing (None or omitted) architecture inputs are filled from consts.py:
+        parameter_count, number_of_layers, hidden_size, and sequence_length.
+        Explicit values always win, even if they differ from the registry.
+        Default sequence length is the checkpoint's CONFIGURED CONTEXT LIMIT;
+        pass the actual training length (e.g. 2048/4096) for your workload.
+    Missing batch_size, training_method, precision, and epochs are filled from
+        ESTIMATOR_DEFAULTS. These are workflow defaults, not model properties.
+        Dataset size is still required unless tokens_per_epoch is supplied.
+    Unknown/custom models need explicit parameter_count and sequence_length.
+        Missing layer count/hidden size keep the original estimator heuristics.
+        Null/blank model names and invalid numeric values are rejected.
 
     Selection order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge,
         ml.p4d.24xlarge, ml.p5.48xlarge. Select the first configuration with
@@ -132,12 +146,12 @@ def estimate_training(
         sharded across all GPUs. Adapter states and activations are replicated.
         Requires a compatible distributed implementation, including FSDP-QLoRA
         for quantized sharding. False means ordinary replicated data parallelism.
-    missing architecture: C = .12*N**(2/3) if either L or h is missing, exactly
+    missing architecture after registry lookup: C = .12*N**(2/3) if either
+        L or h is still missing, exactly
         as requested (do NOT divide by 10 again). Missing h for P and S/h is
         approximated from N = 12*L*h**2; if L is absent too, assume L = h/128.
-        These are crude dense-transformer heuristics, not model-name lookups.
-    pricing: None uses DEMO prices, with explicit labels in the result. Pass all
-        five actual instance-hour prices to estimate costs at your AWS rates.
+        These are crude dense-transformer heuristics for unregistered models.
+    pricing: uses your supplied DEMO_HOURLY_PRICES_USD constant.
     time: effective TFLOPS already includes GPU count and MFU. Do not multiply
         by either again. QLoRA divides throughput by qlora_time_multiplier.
 
@@ -148,8 +162,55 @@ def estimate_training(
     """
     if not isinstance(model_name, str) or not model_name.strip():
         raise ValueError("model_name must be a nonempty string.")
+    if normalize_model_name(model_name) in {"", "null", "none"}:
+        raise ValueError("model_name cannot be blank, null, or None.")
+
+    profile = get_model_defaults(model_name)
+    defaulted_fields = []
+    input_sources = {}
+    resolved = {
+        "parameter_count": parameter_count,
+        "number_of_layers": number_of_layers,
+        "hidden_size": hidden_size,
+        "sequence_length": sequence_length,
+    }
+    for field, value in resolved.items():
+        if value is None and profile is not None:
+            resolved[field] = profile[field]
+            defaulted_fields.append(field)
+            input_sources[field] = "model_defaults"
+        else:
+            input_sources[field] = "explicit" if value is not None else "heuristic"
+
+    missing_required = [field for field in ("parameter_count", "sequence_length") if resolved[field] is None]
+    if missing_required:
+        raise ValueError(
+            f"No registered defaults for {model_name!r}. Provide "
+            + ", ".join(missing_required)
+            + "; number_of_layers and hidden_size can also be supplied."
+        )
+    parameter_count = resolved["parameter_count"]
+    sequence_length = resolved["sequence_length"]
+    number_of_layers = resolved["number_of_layers"]
+    hidden_size = resolved["hidden_size"]
+    workflow = {"batch_size": batch_size, "training_method": training_method,
+                "precision": precision, "epochs": epochs}
+    for field, value in workflow.items():
+        if value is None:
+            workflow[field] = ESTIMATOR_DEFAULTS[field]
+            defaulted_fields.append(field)
+            input_sources[field] = "estimator_defaults"
+        else:
+            input_sources[field] = "explicit"
+    batch_size = workflow["batch_size"]
+    training_method = workflow["training_method"]
+    precision = workflow["precision"]
+    epochs = workflow["epochs"]
+
     n = parse_parameter_count(parameter_count)
-    size = _positive(dataset_size_gb, "dataset_size_gb")
+    if dataset_size_gb is None and tokens_per_epoch is None:
+        raise ValueError("Provide dataset_size_gb or tokens_per_epoch; dataset size is not a model property.")
+    size = None if dataset_size_gb is None else _positive(dataset_size_gb, "dataset_size_gb")
     s = _positive(sequence_length, "sequence_length", integer=True)
     batch = _positive(batch_size, "batch_size", integer=True)
     epochs = _positive(epochs, "epochs", integer=True)
@@ -177,6 +238,14 @@ def estimate_training(
         raise ValueError("This QLoRA formula requires BF16/FP16 mixed compute; use precision='BF16'.")
 
     warnings = []
+    if profile is not None and profile["note"]:
+        warnings.append(profile["note"])
+    if input_sources["sequence_length"] == "model_defaults":
+        warnings.append("Sequence length defaulted to the checkpoint context limit; override it with the actual training length if shorter.")
+    if profile is not None and s > profile["max_position_embeddings"]:
+        warnings.append("Explicit sequence_length exceeds the registered checkpoint context limit; the estimator does not configure context extension.")
+    if profile is None:
+        warnings.append("Unregistered/custom model: using explicit inputs and any remaining architecture heuristics.")
     h = supplied_h
     if h is None:
         h = math.sqrt(n / (12 * layers)) if layers is not None else (128 * n / 12) ** (1 / 3)
@@ -240,6 +309,11 @@ def estimate_training(
     best = next((row for row in candidates if row["feasible"]), None)
     return {
         "model_name": model_name, "parameter_count": n, "training_method": method,
+        "resolved_model_name": None if profile is None else profile["model_name"],
+        "checkpoint_id": None if profile is None else profile["checkpoint_id"],
+        "defaulted_fields": defaulted_fields, "input_sources": input_sources,
+        "model_default_sources": [] if profile is None else list(profile["sources"]),
+        "sequence_length": s, "number_of_layers_used": layers,
         "precision": mode, "epochs": epochs, "checkpointing_enabled": True,
         "micro_batch_size_per_gpu": batch, "sequence_length": s,
         "tokens_per_epoch": epoch_tokens, "total_training_tokens": d,
@@ -248,6 +322,7 @@ def estimate_training(
         "estimated_adapter_parameters": adapter_params,
         "full_ft_state_bytes_per_parameter": full_state_bytes if method == "full_ft" else None,
         "estimated_flops": flops,
+        # "candidates": candidates, "recommended": best,
         "status": "estimated_configuration_found" if best else "no_feasible_configuration",
         "selection_rule": "First memory-feasible, precision-supported configuration in catalog order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge, ml.p4d.24xlarge, ml.p5.48xlarge. Time and cost do not affect selection.",
         "warnings": warnings,
@@ -256,8 +331,8 @@ def estimate_training(
 
 if __name__ == "__main__":
     result = estimate_training(
-        model_name="Llama 3.1 8B", parameter_count="8B", dataset_size_gb=0.4,
-        sequence_length=4096, batch_size=2, training_method="LoRA", precision="BF16",
-        number_of_layers=32, hidden_size=4096, epochs=1,
+        model_name="Llama 3.1 8B", dataset_size_gb=0.4,
+        sequence_length=4096, batch_size=2, training_method="LoRA",
+        # Parameter count, layers, and hidden size come from consts.py.
     )
     print(json.dumps(result, indent=2, allow_nan=False))
