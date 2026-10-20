@@ -2,91 +2,22 @@
 
 Python 3.10+, standard library only. No network access, model download, or training.
 All GB values are decimal (1 GB = 10**9 bytes). Training assumes checkpointing.
-Run this file to see an example using explicitly illustrative hourly prices.
+Run python -m scripts.gpu_broker_estimator from the repository root for an example.
 """
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
 import json
 import math
-import re
-from typing import Mapping
 
-from consts import ESTIMATOR_DEFAULTS, get_model_defaults, normalize_model_name
-from consts import (
-    INFERENCE_DEFAULTS, INFERENCE_WEIGHT_BYTES, INFERENCE_PRECISION_ALIASES)
-
-
-# Aggregate effective throughput for the WHOLE instance, already including MFU.
-# Order: BF16/FP16 Tensor Core, pure FP32 (no TF32), FP8 Tensor Core.
-# Usable VRAM is calculated as 90% of the physical memory below.
-GPU_CATALOG = (
-    ("ml.g5.2xlarge", "A10G", 1, 24, 37.5, 9.4, None),
-    ("ml.g6e.2xlarge", "L40S", 1, 48, 108.6, 27.5, 219.9),
-    ("ml.g6e.12xlarge", "L40S", 4, 48, 362.1, 91.6, 733.0),
-    ("ml.p4d.24xlarge", "A100", 8, 40, 998.4, 62.4, None),
-    ("ml.p5.48xlarge", "H100", 8, 80, 3166.4, 214.4, 6332.8),
+from scripts.consts import (
+    ESTIMATOR_DEFAULTS, get_model_defaults, normalize_model_name,
+    INFERENCE_DEFAULTS, INFERENCE_WEIGHT_BYTES, INFERENCE_PRECISION_ALIASES,
+    GPU_CATALOG, DEMO_HOURLY_PRICES_USD, TRAINING_METHOD,
+    PRECISION_ALIASES, FULL_FT_STATE_BYTES_PER_PARAMETER, DEFAULT_LORA_RANK,
+    TRAINING_SELECTION_RULE, INFERENCE_SELECTION_RULE,
 )
-
-DEMO_HOURLY_PRICES_USD = {
-    "ml.g5.2xlarge": 1.5,
-    "ml.g6e.2xlarge": 2.24,
-    "ml.g6e.12xlarge": 10.49,
-    "ml.p4d.24xlarge": 25.25,
-    "ml.p5.48xlarge": 63.30,
-}
-
-TRAINING_METHOD = {"full": "full_ft", "fullft": "full_ft", "fullfinetuning": "full_ft",
-              "fullfinetune": "full_ft", "lora": "lora", "qlora": "qlora"}
-
-PRECISION_ALIASES = {
-        "bf16": "bf16_mixed", "fp16": "bf16_mixed", "bf16mixed": "bf16_mixed",
-        "fp16mixed": "bf16_mixed", "bf16mixedfp32adam": "bf16_mixed",
-        "fp32": "pure_fp32", "purefp32": "pure_fp32",
-        "purebf16": "pure_bf16", "purefp16": "pure_bf16",
-        "bf168bitadam": "bf16_8bit_adam", "bf16mixed8bitadam": "bf16_8bit_adam",
-        "fp8": "fp8_mixed", "fp8mixed": "fp8_mixed",
-}
-
-FULL_FT_STATE_BYTES_PER_PARAMETER = {
-    "bf16_mixed": 16,
-    "pure_fp32": 16,
-    "pure_bf16": 8,
-    "bf16_8bit_adam": 10,
-    "fp8_mixed": 16,
-}
-
-def _key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).lower())
-
-
-def _positive(value, name: str, *, integer: bool = False):
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive {'integer' if integer else 'number'}.")
-    try:
-        number = float(value)
-    except (ValueError, TypeError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a positive number.") from exc
-    if not math.isfinite(number) or number <= 0 or (integer and not number.is_integer()):
-        raise ValueError(f"{name} must be a finite positive {'integer' if integer else 'number'}.")
-    return int(number) if integer else number
-
-
-def parse_parameter_count(value: str | int | float) -> int:
-    """Accept 7B, 400M, 100K, 15,700, 1.5B, or a plain positive integer."""
-    if isinstance(value, bool):
-        raise ValueError("parameter_count must be a positive integer or K/M/B string.")
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMB]?)\s*", str(value).replace(",", ""), re.I)
-    if not match:
-        raise ValueError("Invalid parameter_count. Examples: '7B', '400M', '100K', 15700.")
-    try:
-        count = Decimal(match[1]) * {"": 1, "K": 10**3, "M": 10**6, "B": 10**9}[match[2].upper()]
-    except InvalidOperation as exc:
-        raise ValueError("Invalid parameter_count.") from exc
-    if not count.is_finite() or count <= 0 or count != count.to_integral_value():
-        raise ValueError("parameter_count must resolve to a positive whole number.")
-    return int(count)
+from scripts.utils import key as _key, positive as _positive, parse_parameter_count, select_training_configuration
 
 
 def estimate_training(
@@ -99,9 +30,10 @@ def estimate_training(
     precision: str | None = None,
     number_of_layers: int | None = None,
     hidden_size: int | None = None,
-    epochs: int | None = None,
+    epochs: float | None = None,
     *,
-    lora_rank: int = 16,
+    lora_rank: int = DEFAULT_LORA_RANK,
+    training_time_constraint_hours: float | str | None = None,
     bytes_per_token: float = 4.0,
     tokens_per_epoch: int | None = None,
     shard_model_states: bool = True,
@@ -125,7 +57,9 @@ def estimate_training(
     Selection order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge,
         ml.p4d.24xlarge, ml.p5.48xlarge. Select the first configuration with
         enough per-GPU memory and support for the requested precision.
-        Time and cost are reported but do not affect configuration selection.
+        A numeric training_time_constraint_hours also constrains selection.
+        "urgent" selects the next feasible configuration, or retains the only one.
+        Prices are illustrative and do not determine selection.
 
     batch_size: PER-GPU micro-batch size, before gradient accumulation. It stays
         fixed on every candidate, so global batch size can change with GPU count.
@@ -141,6 +75,7 @@ def estimate_training(
         FP8 / fp8_mixed -> 16, with BF16 activations/frozen weights.
         Eight bytes is the user's explicit low-precision optimizer assumption,
         NOT a universal memory requirement of BF16/FP16 training.
+    Pretraining uses the full-weight training formulas. Fractional epochs are allowed.
     LoRA/QLoRA: always 16 bytes per adapter parameter per the supplied formula.
         Quantized base storage in QLoRA is always 0.52 bytes/parameter. QLoRA
         accepts BF16/FP16 mixed only; it does NOT use FP8 compute throughput.
@@ -215,7 +150,7 @@ def estimate_training(
     size = None if dataset_size_gb is None else _positive(dataset_size_gb, "dataset_size_gb")
     s = _positive(sequence_length, "sequence_length", integer=True)
     batch = _positive(batch_size, "batch_size", integer=True)
-    epochs = _positive(epochs, "epochs", integer=True)
+    epochs = _positive(epochs, "epochs")
     rank = _positive(lora_rank, "lora_rank", integer=True)
     bpt = _positive(bytes_per_token, "bytes_per_token")
     slowdown = _positive(qlora_time_multiplier, "qlora_time_multiplier")
@@ -231,7 +166,7 @@ def estimate_training(
 
     method = TRAINING_METHOD.get(_key(training_method))
     if method is None:
-        raise ValueError("training_method must be LoRA, QLoRA, or Full fine-tuning.")
+        raise ValueError("training_method must be LoRA, QLoRA, Full fine-tuning, or Pretraining.")
 
     mode = PRECISION_ALIASES.get(_key(precision))
     if mode is None:
@@ -308,7 +243,8 @@ def estimate_training(
             "hourly_price_usd": DEMO_HOURLY_PRICES_USD[name],
             "estimated_cost_usd": None if hours is None else hours * DEMO_HOURLY_PRICES_USD[name],
         })
-    best = next((row for row in candidates if row["feasible"]), None)
+    best, selection_notes = select_training_configuration(candidates, training_time_constraint_hours)
+    warnings.extend(selection_notes)
     return {
         "model_name": model_name, "parameter_count": n, "training_method": method,
         "resolved_model_name": None if profile is None else profile["model_name"],
@@ -317,16 +253,18 @@ def estimate_training(
         "model_default_sources": [] if profile is None else list(profile["sources"]),
         "sequence_length": s, "number_of_layers_used": layers,
         "precision": mode, "epochs": epochs, "checkpointing_enabled": True,
-        "micro_batch_size_per_gpu": batch, "sequence_length": s,
+        "micro_batch_size_per_gpu": batch,
         "tokens_per_epoch": epoch_tokens, "total_training_tokens": d,
         "hidden_size_used": h, "hidden_size_inferred": supplied_h is None,
         "activation_coefficient_c": c, "activation_coefficient_source": c_source,
         "estimated_adapter_parameters": adapter_params,
         "full_ft_state_bytes_per_parameter": full_state_bytes if method == "full_ft" else None,
         "estimated_flops": flops,
-        # "candidates": candidates, "recommended": best,
+        "candidates": candidates, "recommended": best,
         "status": "estimated_configuration_found" if best else "no_feasible_configuration",
-        "selection_rule": "First memory-feasible, precision-supported configuration in catalog order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge, ml.p4d.24xlarge, ml.p5.48xlarge. Time and cost do not affect selection.",
+        "selection_rule": TRAINING_SELECTION_RULE,
+        "training_time_constraint_hours": training_time_constraint_hours,
+        "prices_are_illustrative": True,
         "warnings": warnings,
     }
 
@@ -500,9 +438,9 @@ def estimate_inference(
         "memory_distribution": "even model-and-KV sharding" if shard_model_states else "replicated model and B-sequence KV cache on each GPU",
         "defaulted_fields": defaulted_fields, "input_sources": input_sources,
         "model_default_sources": [] if profile is None else list(profile["sources"]),
-        # "candidates": candidates, "recommended": best,
+        "candidates": candidates, "recommended": best,
         "status": "estimated_configuration_found" if best else "no_feasible_configuration",
-        "selection_rule": "First memory-feasible, precision-supported configuration in catalog order: ml.g5.2xlarge, ml.g6e.2xlarge, ml.g6e.12xlarge, ml.p4d.24xlarge, ml.p5.48xlarge.",
+        "selection_rule": INFERENCE_SELECTION_RULE,
         "assumptions": [
             "Multi-GPU sharding, if enabled, is idealized and requires a compatible inference runtime.",
         ],
