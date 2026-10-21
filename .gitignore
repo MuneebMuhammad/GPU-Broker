@@ -4,3 +4,4 @@ __pycache__/**/*
 data/.DS_Store
 scripts/__pycache__/**/*
 endpoints/__pycache__/**/*
+test-api.http

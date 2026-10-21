@@ -1,8 +1,12 @@
 """Stateless conversational extraction followed by deterministic GPU estimation."""
 
 import json
+import os
 
 from openai import OpenAI, APIError, APITimeoutError
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 from scripts.consts import (
     AGENT_MODEL, AGENT_PROMPT, AGENT_UPDATE_SCHEMA, AGENT_MAX_OUTPUT_TOKENS,
@@ -27,6 +31,7 @@ class AgentTimeoutError(AgentUpstreamError):
 class GPUAgent:
     def __init__(self, client=None):
         self.client = client if client is not None else OpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY"),
             timeout=AGENT_TIMEOUT_SECONDS, max_retries=AGENT_MAX_RETRIES,
         )
 
