@@ -1,4 +1,4 @@
-"""WSGI factory: gunicorn --timeout 120 'app:create_app()'."""
+"""Flask factory and WSGI entry point for Vercel and Gunicorn."""
 
 from flask import Flask, jsonify
 
@@ -19,6 +19,9 @@ def create_app(*, agent=None):
 
     return app
 
+
+app = create_app()
+
+
 if __name__ == "__main__":
-    app = create_app()
     app.run(debug=True)

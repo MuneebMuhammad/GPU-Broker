@@ -22,7 +22,7 @@ Run the notebook cells in order. Keep the dataset at `data/data.xlsx` so the rel
 
 ## GPU chat API
 
-Install the small API dependency set with `pip install -r requirements-api.txt`.
+Install the small API dependency set with `pip install -r requirements-conda.txt`.
 Set `OPENAI_API_KEY` in the deployment environment. For local development, Flask
 and the notebook CLI can load it from the repository's ignored `.env` file.
 
@@ -33,13 +33,18 @@ From the repository root:
 flask --app app:create_app run
 
 # Production WSGI entry point; set OPENAI_API_KEY in the process environment.
-gunicorn --workers 2 --timeout 120 'app:create_app()'
+gunicorn --workers 2 --timeout 120 app:app
 ```
+
+`app.py` also exports a module-level `app` instance for Vercel discovery. Set
+`OPENAI_API_KEY` in Vercel's environment variables before deploying. The API uses
+`requirements-conda.txt`; is a Conda export, not a pip
+requirements file, so deployment dependency installation must use the API file.
 
 Send `POST /api/gpu/chat` with JSON:
 
 ```json
-{"message": "Fine-tune Llama 3.2 3B with LoRA on 5 GB of text", "state": null}
+{ "message": "Fine-tune Llama 3.2 3B with LoRA on 5 GB of text", "state": null }
 ```
 
 The response contains `status` (`needs_input`, `ready`, or
