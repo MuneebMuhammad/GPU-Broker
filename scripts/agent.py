@@ -93,7 +93,6 @@ class GPUAgent:
                 "Dense-transformer training with checkpointing and ideal model-state sharding.",
                 "Uncompressed text is estimated at 4 bytes per token; QLoRA time multiplier is 1.3.",
                 "Training time excludes loading, checkpoint saves, and storage operations.",
-                "Prices are illustrative demo prices, not live deployment quotes.",
             ]
             if estimate["activation_coefficient_source"] == "0.12*N**(2/3)":
                 result["assumptions"].append("Activation memory uses a parameter-count heuristic because architecture is incomplete; no layer count is invented.")
