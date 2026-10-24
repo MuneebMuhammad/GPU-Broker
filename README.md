@@ -5,24 +5,27 @@ An early-stage AI Systems project exploring model fine-tuning requests and their
 ## Repository contents
 
 - `playground.ipynb` — loads the dataset and displays previews, summary statistics, and column information.
+- `training_experiments.ipynb` — evaluates AI-based workload parameter extraction, compares prompt performance, and includes an interactive GPU recommendation chat.
 - `data/data.xlsx` — sample fine-tuning requests and their structured training parameters. My data is only 60 samples, so I will be storing it in the repository directly.
-- `requirements.txt` — a Conda environment export for Intel macOS (`osx-64`).
+- `requirements.txt` — pip dependencies for the API, scripts, and notebooks.
 
 ## Quick start
 
-Run these commands from the repository root with Conda installed:
+Run these commands from the repository root with Python 3.11 or newer installed:
 
 ```bash
-conda create --name gpu-broker --file requirements.txt
-conda activate gpu-broker
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m ipykernel install --user --name gpu-broker --display-name "Python (GPU-Broker)"
 jupyter lab playground.ipynb
 ```
 
-Run the notebook cells in order. Keep the dataset at `data/data.xlsx` so the relative file path resolves correctly.
+Select the **Python (GPU-Broker)** kernel in either notebook and run the cells in order. Keep the dataset at `data/data.xlsx` so the relative file path resolves correctly.
 
 ## GPU chat API
 
-Install the small API dependency set with `pip install -r requirements-conda.txt`.
+Install the repository dependencies with `python -m pip install -r requirements.txt`.
 Set `OPENAI_API_KEY` in the deployment environment. For local development, Flask
 and the notebook CLI can load it from the repository's ignored `.env` file.
 
@@ -37,9 +40,8 @@ gunicorn --workers 2 --timeout 120 app:app
 ```
 
 `app.py` also exports a module-level `app` instance for Vercel discovery. Set
-`OPENAI_API_KEY` in Vercel's environment variables before deploying. The API uses
-`requirements-conda.txt`; is a Conda export, not a pip
-requirements file, so deployment dependency installation must use the API file.
+`OPENAI_API_KEY` in Vercel's environment variables before deploying. The API and
+notebooks share the pip-compatible `requirements.txt` file.
 
 Send `POST /api/gpu/chat` with JSON:
 
@@ -84,16 +86,5 @@ retry; there is no second model call to repair an invalid model response. The
 factory can accept an injected agent for testing and does not enable debug mode.
 
 To chat without HTTP, run the **Chat with the GPU recommendation agent** cells at
-the end of `playground.ipynb`. They work independently of notebook evaluations
+the end of `training_experiments.ipynb`. They work independently of notebook evaluations
 and support `/reset` and `/exit`.
-
-Run deterministic tests from the repository root:
-
-```bash
-python -m pytest -q tests/test_gpu_agent.py
-python -m scripts.gpu_broker_estimator
-```
-
-The tests mock model responses; live API use occurs only through the endpoint or
-the notebook CLI. Deploy behind your application's existing authentication and
-access controls; this component does not implement user accounts or billing.
