@@ -63,6 +63,22 @@ length, batch size, training method, precision, layers, hidden size, epochs,
 training deadline, workload type, and LoRA rank. Other estimator settings are
 fixed. State is validated on every request and is not an authorization token.
 
+The agent sizes LLM workloads only. Non-LLM requests, such as training ResNet-18,
+YOLO object detection, or image diffusion, receive an explanation that only LLM
+pretraining, fine-tuning, and inference are supported. Scope is classified in the
+same GPT call as field extraction. Unsupported requests do not invoke either
+estimator or modify the previous conversation state. They return HTTP 200 with
+the existing `needs_input` status, no GPU configuration or duration, and no
+non-LLM field questions. This preserves compatibility with the current UI. The
+user can resume the previous LLM request or describe a new one. Unknown custom
+LLMs and short replies to pending questions still use normal clarification.
+
+Run deterministic agent scope and Flask-contract tests without network calls:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 Known models use the registry in `scripts/consts.py`, including the full configured
 context length when sequence length is omitted. Explicit workload values win.
 Changing models refreshes model-specific architecture while retaining explicit

@@ -113,7 +113,8 @@ def validate_state(state):
 
 
 def validate_updates(patch):
-    if not isinstance(patch, dict) or set(patch) != {"reset", "updates"} or type(patch["reset"]) is not bool:
+    if (not isinstance(patch, dict) or set(patch) != {"is_llm_request", "reset", "updates"}
+            or type(patch["is_llm_request"]) is not bool or type(patch["reset"]) is not bool):
         raise ValueError("Invalid model response structure.")
     if not isinstance(patch["updates"], list) or len(patch["updates"]) > len(AGENT_FIELDS):
         raise ValueError("Invalid model updates.")

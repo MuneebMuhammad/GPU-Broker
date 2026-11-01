@@ -12,6 +12,7 @@ from scripts.consts import (
     AGENT_MODEL, AGENT_PROMPT, AGENT_UPDATE_SCHEMA, AGENT_MAX_OUTPUT_TOKENS,
     AGENT_TIMEOUT_SECONDS, AGENT_MAX_RETRIES, MAX_MESSAGE_LENGTH,
     DEFAULT_LORA_RANK, INFERENCE_DEFAULTS,
+    UNSUPPORTED_WORKLOAD_MESSAGE,
 )
 from scripts.gpu_broker_estimator import estimate_training, estimate_inference
 from scripts.utils import (
@@ -39,7 +40,8 @@ class GPUAgent:
         if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_LENGTH:
             raise ValueError(f"message must contain 1–{MAX_MESSAGE_LENGTH} characters.")
         state = validate_state(state)
-        current, _, current_issues = resolve_fields(state)
+        previous_state = validate_state(state)
+        current, current_sources, current_issues = resolve_fields(state)
         state["pending_fields"] = list(current_issues)
         try:
             response = self.client.responses.create(
@@ -60,6 +62,16 @@ class GPUAgent:
             patch = validate_updates(json.loads(response.output_text))
         except (ValueError, TypeError) as exc:
             raise AgentUpstreamError("The AI service returned an invalid response. Retry with the same state.") from exc
+
+        if not patch["is_llm_request"]:
+            # Keep the public response contract and previous LLM state, but never
+            # merge out-of-scope edits or run transformer formulas for another model family.
+            return {
+                "status": "needs_input", "message": UNSUPPORTED_WORKLOAD_MESSAGE,
+                "state": previous_state, "fields": current, "field_sources": current_sources,
+                "missing_fields": [], "estimated_fields": [], "assumptions": [],
+                "gpu_configuration": None, "estimated_time_hours": None,
+            }
 
         state = merge_updates(state, patch)
         fields, sources, issues = resolve_fields(state)
