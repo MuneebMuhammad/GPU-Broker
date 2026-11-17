@@ -1,9 +1,11 @@
 # GPU-Broker
 
-An early-stage AI Systems project exploring model fine-tuning requests and their training requirements. The current notebook uses pandas to inspect sample requests, including model size, dataset size, sequence length, and training method.
+An early-stage AI Systems project exploring model fine-tuning requests and their training requirements. The current notebook uses pandas to inspect sample requests, including model size, dataset size, sequence length, and training method. A Flask application exposes a conversational API that collects LLM workload requirements and recommends GPU configurations using the shared GPU agent.
 
 ## Repository contents
 
+- `app.py` — Flask application factory and WSGI entry point for the GPU chat API.
+- `endpoints/routes.py` — handles chat requests at `POST /api/gpu/chat` and returns JSON responses.
 - `playground.ipynb` — loads the dataset and displays previews, summary statistics, and column information.
 - `training_experiments.ipynb` — evaluates AI-based workload parameter extraction, compares prompt performance, and includes an interactive GPU recommendation chat.
 - `data/data.xlsx` — sample fine-tuning requests and their structured training parameters. My data is only 60 samples, so I will be storing it in the repository directly.
@@ -23,7 +25,13 @@ jupyter lab playground.ipynb
 
 Select the **Python (GPU-Broker)** kernel in either notebook and run the cells in order. Keep the dataset at `data/data.xlsx` so the relative file path resolves correctly.
 
-## GPU chat API
+## Flask app and GPU chat API
+
+The Flask app serves a JSON API for chatting with the GPU recommendation agent.
+It supports LLM pretraining, fine-tuning, and inference workloads, asks for
+clarification when needed, and returns a recommended GPU configuration with
+estimated training time where applicable. It does not include a browser UI;
+clients interact with the chat endpoint over HTTP.
 
 Install the repository dependencies with `python -m pip install -r requirements.txt`.
 Set `OPENAI_API_KEY` in the deployment environment. For local development, Flask
@@ -37,6 +45,15 @@ flask --app app:create_app run
 
 # Production WSGI entry point; set OPENAI_API_KEY in the process environment.
 gunicorn --workers 2 --timeout 120 app:app
+```
+
+The local development server runs at `http://127.0.0.1:5000` by default. With
+the server running, try a request from another terminal:
+
+```bash
+curl http://127.0.0.1:5000/api/gpu/chat \
+  -H 'Content-Type: application/json' \
+  -d '{ "message": "Fine-tune Llama 3.2 3B with LoRA on 5 GB of text", "state": null }'
 ```
 
 `app.py` also exports a module-level `app` instance for Vercel discovery. Set
