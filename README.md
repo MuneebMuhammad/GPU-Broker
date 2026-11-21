@@ -75,6 +75,14 @@ unchanged with the next message, for example “Use batch size 2 instead.” Pas
 pending questions, not cached defaults or credentials. Each client keeps its own
 state, so requests can reach different workers without a session database.
 
+Every successful HTTP response also includes `turn_metrics`. Its
+`response_time_ms` measures the agent's processing time in whole milliseconds,
+including the model call and GPU estimation. `input_tokens` and `output_tokens`
+come from that call's reported usage. `cost_usd` is a decimal string priced at
+the global Standard GPT-6.1 Sol rate, with separate charges for uncached input,
+cached reads, 30-minute writes, 12-hour writes, and output. An unavailable token
+count or cost is `null`. [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
+
 The agent accepts only model name, parameter count, dataset size in GB, sequence
 length, batch size, training method, precision, layers, hidden size, epochs,
 training deadline, workload type, and LoRA rank. Other estimator settings are

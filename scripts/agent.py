@@ -15,6 +15,7 @@ from scripts.consts import (
     UNSUPPORTED_WORKLOAD_MESSAGE,
 )
 from scripts.gpu_broker_estimator import estimate_training, estimate_inference
+from scripts.agent_usage import agent_usage
 from scripts.utils import (
     validate_state, validate_updates, merge_updates, resolve_fields, clarification_message,
     checked_estimate,
@@ -37,6 +38,11 @@ class GPUAgent:
         )
 
     def respond(self, message, state=None):
+        result, _ = self.respond_with_usage(message, state)
+        return result
+
+    def respond_with_usage(self, message, state=None):
+        """Return the recommendation and token accounting for this turn."""
         if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_LENGTH:
             raise ValueError(f"message must contain 1–{MAX_MESSAGE_LENGTH} characters.")
         state = validate_state(state)
@@ -45,7 +51,7 @@ class GPUAgent:
         state["pending_fields"] = list(current_issues)
         try:
             response = self.client.responses.create(
-                model=AGENT_MODEL, reasoning={"effort": "medium"},
+                model=AGENT_MODEL, reasoning={"effort": "medium"}, service_tier="default",
                 instructions=AGENT_PROMPT,
                 input=json.dumps({"message": message, "state": state, "resolved_fields": current}, allow_nan=False),
                 text={"format": {"type": "json_schema", "name": "gpu_field_updates",
@@ -63,6 +69,7 @@ class GPUAgent:
         except (ValueError, TypeError) as exc:
             raise AgentUpstreamError("The AI service returned an invalid response. Retry with the same state.") from exc
 
+        usage = agent_usage(response)
         if not patch["is_llm_request"]:
             # Keep the public response contract and previous LLM state, but never
             # merge out-of-scope edits or run transformer formulas for another model family.
@@ -71,7 +78,7 @@ class GPUAgent:
                 "state": previous_state, "fields": current, "field_sources": current_sources,
                 "missing_fields": [], "estimated_fields": [], "assumptions": [],
                 "gpu_configuration": None, "estimated_time_hours": None,
-            }
+            }, usage
 
         state = merge_updates(state, patch)
         fields, sources, issues = resolve_fields(state)
@@ -84,7 +91,7 @@ class GPUAgent:
         }
         if issues:
             result["message"] = clarification_message(issues)
-            return result
+            return result, usage
 
         common = {field: fields[field] for field in (
             "model_name", "parameter_count", "sequence_length", "precision", "number_of_layers", "hidden_size",
@@ -145,4 +152,4 @@ class GPUAgent:
             result["message"] += " Estimated fields: " + ", ".join(result["estimated_fields"]) + "."
         if fields["number_of_layers"] is None or sources["hidden_size"] in ("estimated", "unavailable"):
             result["message"] += " Memory uses architecture heuristics; see assumptions."
-        return result
+        return result, usage
